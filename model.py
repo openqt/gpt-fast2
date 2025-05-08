@@ -92,12 +92,16 @@ transformer_configs = {
     "llama-3.1-405b": dict(block_size=131072, n_layer=126, n_head=128, n_local_heads=8, dim=16384, intermediate_size=53248, vocab_size=128256, rope_base=500000,
         rope_scaling=dict(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
     ),
+    "llama-3.2-1b": dict(block_size=131072, n_layer=16, n_head=32, n_local_heads=8, dim=2048, intermediate_size=8192, vocab_size=128256, rope_base=500000,
+        rope_scaling=dict(factor=32.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
+    ),
 }
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_length, head_dim)
+        print(f">>> cache_shape (max_batch_size, n_heads, max_seq_length, head_dim): {cache_shape}")
         self.register_buffer('k_cache', torch.zeros(cache_shape, dtype=dtype))
         self.register_buffer('v_cache', torch.zeros(cache_shape, dtype=dtype))
 
@@ -186,7 +190,7 @@ class Attention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.wqkv = nn.Linear(config.dim, total_head_dim, bias=False)
         self.wo = nn.Linear(config.dim, config.dim, bias=False)
-        self.kv_cache = None
+        self.kv_cache : Optional[KVCache] = None
 
         self.n_head = config.n_head
         self.head_dim = config.head_dim
@@ -279,18 +283,22 @@ def precompute_freqs_cis(
     dtype: torch.dtype = torch.bfloat16,
     rope_scaling: Optional[dict] = None,
 ) -> Tensor:
+    # 词嵌入两两分组后，计算每个分组对应的旋转角度 theta
     freqs = 1.0 / (base ** (torch.arange(0, n_elem, 2)[: (n_elem // 2)].float() / n_elem))
     if rope_scaling is not None:
         freqs = apply_rope_scaling(freqs, rope_scaling)
-    t = torch.arange(seq_len, device=freqs.device)
-    freqs = torch.outer(t, freqs)
+    # 计算每个位置对应的旋转角度 m*theta
+    m = torch.arange(seq_len, device=freqs.device)
+    freqs = torch.outer(m, freqs)
+    # 计算每个位置对应的旋转角度对应的复数
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    # 将每个位置对应的旋转角度对应的复数，freqs_cis = [cos(x) + sin(x)i, cos(y) + sin(y)i]
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
     return cache.to(dtype=dtype)
 
-
+# 应用旋转角度
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)  # [B, S, D] -> [B, S, H, D/2, 2]
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [

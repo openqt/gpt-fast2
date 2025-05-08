@@ -94,11 +94,11 @@ def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torc
         new_probs.append(next_prob.clone())
         cur_token = next_token.clone()
 
-    return new_tokens, new_probs
+    return new_tokens, new_probs, block_mask
 
 
-def model_forward(model, x, input_pos):
-    return model(x, input_pos)
+def model_forward(model, mask, x, input_pos):
+    return model(mask, x, input_pos)
 
 def speculative_decode(
     model: Transformer,
@@ -111,17 +111,20 @@ def speculative_decode(
     # draft model inference sequentially
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
+    draft_tokens, draft_probs, block_mask = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
 
     draft_tokens = torch.cat(draft_tokens)
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
-        torch.cat([cur_token.view(1), draft_tokens]).view(1, -1),
+        block_mask,
+        torch.cat([cur_token.view(1,1), draft_tokens]).view(1, -1),
         torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device)
     )
     target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
-    draft_probs = torch.stack(draft_probs)
+    draft_probs = torch.cat(draft_probs)
+    draft_tokens = draft_tokens.squeeze(-1) 
+
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
@@ -134,14 +137,11 @@ def speculative_decode(
         accept_length = speculate_k + 1
         last_token = multinomial_sample_one_no_sync(target_probs[-1])
         # fill last token into draft model
-        model_forward(
-            draft_model,
-            draft_tokens[-1].view(1, -1),
-            orig_input_pos + speculate_k,
-        )
+        model_forward(draft_model, block_mask, draft_tokens[-1].view(1, -1), orig_input_pos + speculate_k)
         return torch.cat([draft_tokens, last_token])
     else:
         accept_length = rejected_locations[0].item()
+        print(f">>> speculative: accept length: {accept_length} at {input_pos}")
         p = draft_probs[accept_length]
         q = target_probs[accept_length]
         new = q - p
@@ -210,13 +210,13 @@ def generate(
 
             accept_counts[len(next_tokens) - 1] += 1
             num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
+            seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
             for i in next_tokens[: num_added,]:
                 callback(i)
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        generated_tokens, _, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
 
     generate_stats = {
@@ -284,14 +284,14 @@ def _get_model_size(model):
 B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
-    prompt: Union[int, str] = "Hello, my name is",
+    prompt: Union[int, str] = None,
     interactive: bool = False,
     num_samples: int = 5,
     max_new_tokens: int = 100,
     batch_size: int = 1,
     top_k: int = 200,
     temperature: float = 0.8,
-    checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
+    checkpoint_path: Path = None,
     compile: bool = True,
     compile_prefill: bool = False,
     profile: Optional[Path] = None,
@@ -468,7 +468,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size to benchmark with')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
-    parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
+    parser.add_argument('--checkpoint_path', type=Path, default=Path("data/Meta-Llama-3.1-8B/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')

@@ -34,24 +34,45 @@ def dynamically_quantize_per_channel(x, quant_min, quant_max, target_dtype):
     min_val, max_val = torch.aminmax(x, dim=1)
 
     # calculate scales and zero_points based on min and max
-    # reference: https://fburl.com/code/srbiybme
     min_val_neg = torch.min(min_val, torch.zeros_like(min_val))
     max_val_pos = torch.max(max_val, torch.zeros_like(max_val))
     device = min_val_neg.device
 
-    # reference: https://fburl.com/code/4wll53rk
     max_val_pos = torch.max(-min_val_neg, max_val_pos)
     scales = max_val_pos / (float(quant_max - quant_min) / 2)
     # ensure scales is the same dtype as the original tensor
     scales = torch.clamp(scales, min=eps).to(x.dtype)
     zero_points = torch.zeros(min_val_neg.size(), dtype=torch.int64, device=device)
-
     # quantize based on qmin/qmax/scales/zp
-    # reference: https://www.internalfb.com/code/fbsource/[8edc275012b1]/fbcode/caffe2/torch/ao/quantization/fx/_decomposed.py?lines=63
     x_div = x / scales.unsqueeze(-1)
     x_round = torch.round(x_div)
     x_zp = x_round + zero_points.unsqueeze(-1)
     quant = torch.clamp(x_zp, quant_min, quant_max).to(target_dtype)
+
+    return quant, scales, zero_points
+
+
+def dynamically_quantize_per_channel2(x, quant_min, quant_max, target_dtype):
+    # assumes symmetric quantization
+    # assumes axis == 0
+    # assumes dense memory format
+
+    # default setup for affine quantization of activations
+    eps = torch.finfo(torch.float32).eps
+
+    # get min and max
+    min_val, max_val = torch.aminmax(x, dim=1)
+
+    # calculate scales and zero_points based on min and max
+    scales = (max_val - min_val) / (quant_max - quant_min)
+    scales = torch.clamp(scales, min=1e-6).to(x.dtype)
+
+    # ensure scales is the same dtype as the original tensor
+    zero_points = torch.zeros_like(scales, dtype=torch.int64, device=x.device)
+
+    # quantize based on qmin/qmax/scales/zp
+    quant = torch.round(x / scales.unsqueeze(-1)) + zero_points.unsqueeze(-1)
+    quant = torch.clamp(quant, quant_min, quant_max).to(target_dtype)
 
     return quant, scales, zero_points
 
@@ -71,10 +92,32 @@ def get_group_qparams(w, n_bit=4, groupsize=128):
     max_int = 2**n_bit - 1
     scales = (max_val - min_val).clamp(min=1e-6) / max_int
     zeros = min_val + scales * (2 ** (n_bit - 1))
+    # zeros = min_val * scales + (2 ** (n_bit - 1))
     return scales.to(torch.bfloat16).reshape(w.shape[0], -1), zeros.to(
         torch.bfloat16
     ).reshape(w.shape[0], -1)
 
+
+def get_group_qparams2(w, n_bit=4, groupsize=128):
+    # needed for GPTQ with padding
+    if groupsize > w.shape[-1]:
+        groupsize = w.shape[-1]
+    assert groupsize > 1
+    assert w.shape[-1] % groupsize == 0
+    assert w.dim() == 2
+
+    to_quant = w.reshape(-1, groupsize)
+    assert torch.isnan(to_quant).sum() == 0
+
+    max_val = to_quant.amax(dim=1, keepdim=True)
+    min_val = to_quant.amin(dim=1, keepdim=True)
+    max_int = 2**n_bit - 1
+    scales = (max_val - min_val).clamp(min=1e-6) / max_int
+    # zeros = min_val + scales * (2 ** (n_bit - 1))
+    zeros = max_int - max_val / scales
+    return scales.to(torch.bfloat16).reshape(w.shape[0], -1), zeros.to(
+        torch.bfloat16
+    ).reshape(w.shape[0], -1)
 
 def pack_scales_and_zeros(scales, zeros):
     assert scales.shape == zeros.shape
@@ -128,9 +171,31 @@ def group_quantize_tensor_from_qparams(w, scales, zeros, n_bit=4, groupsize=128)
     return w_int32
 
 
+def group_quantize_tensor_from_qparams2(w, scales, zeros, n_bit=4, groupsize=128):
+    assert groupsize > 1
+    # needed for GPTQ single column quantize
+    if groupsize > w.shape[-1] and scales.shape[-1] == 1:
+        groupsize = w.shape[-1]
+
+    assert w.shape[-1] % groupsize == 0
+    assert w.dim() == 2
+
+    to_quant = w.reshape(-1, groupsize)
+    assert torch.isnan(to_quant).sum() == 0
+
+    scales = scales.reshape(-1, 1)
+    zeros = zeros.reshape(-1, 1)
+    max_int = 2**n_bit - 1
+    return torch.round(to_quant/scales + zeros).clamp(0, max_int).to(torch.int32).reshape_as(w)
+
+
 def group_quantize_tensor(w, n_bit=4, groupsize=128):
     scales, zeros = get_group_qparams(w, n_bit, groupsize)
     w_int32 = group_quantize_tensor_from_qparams(w, scales, zeros, n_bit, groupsize)
+
+    # scales2, zeros2 = get_group_qparams2(w, n_bit, groupsize)
+    # w_int322 = group_quantize_tensor_from_qparams2(w, scales2, zeros2, n_bit, groupsize)
+
     scales_and_zeros = pack_scales_and_zeros(scales, zeros)
     return w_int32, scales_and_zeros
 
@@ -328,6 +393,9 @@ class WeightOnlyInt8QuantHandler:
                 int8_weight, scales, _ = dynamically_quantize_per_channel(mod.weight.float(), -128, 127, torch.int8)
                 cur_state_dict[f"{fqn}.weight"] = int8_weight
                 cur_state_dict[f"{fqn}.scales"] = scales.to(mod.weight.dtype)
+                print(f"Quantized {fqn}.scales => {scales.shape} {scales.dtype}, weight => {int8_weight.shape} {int8_weight.dtype}")
+            else:
+                print(f"Skipping {fqn}")
 
         return cur_state_dict
 
@@ -360,7 +428,7 @@ def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_til
     weight_int32, scales_and_zeros = group_quantize_tensor(
         weight_bf16, n_bit=4, groupsize=groupsize
     )
-    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(weight_int32, inner_k_tiles)
+    weight_int4pack = torch.ops.aten._convert_weight_to_int4pack(weight_int32.to(torch.uint8), inner_k_tiles)
     return weight_int4pack, scales_and_zeros
 
 
@@ -595,7 +663,7 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f"{label}int4-gptq.g{groupsize}.pth")
     else:
-        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gpptq]")
+        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gptq]")
 
     quantize_path = dir_name / new_base_name
     print(f"Writing quantized weights to {quantize_path}")
@@ -606,7 +674,7 @@ def quantize(
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Quantize a model.')
+    parser = argparse.ArgumentParser(description='Quantize a model.', exit_on_error=False)
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Path to the model checkpoint to be quantized.')
     parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq'], help='type of quantization to perform')
     parser.add_argument('--groupsize', type=int, default=32, help='Group size for int4 quantization.')
