@@ -93,14 +93,21 @@ def convert_hf_checkpoint(
         if "layers" in key:
             abstract_key = re.sub(r'(\d+)', '{}', key)
             layer_num = re.search(r'\d+', key).group(0)
-            new_key = weight_map[abstract_key]
+            new_key = weight_map.get(abstract_key)
             if new_key is None:
                 continue
             new_key = new_key.format(layer_num)
         else:
-            new_key = weight_map[key]
+            new_key = weight_map.get(key)
+            if new_key is None:
+                continue
 
         final_result[new_key] = value
+
+    # Handle lm_head.weight — if missing (weight-tying), duplicate embed_tokens
+    if "output.weight" not in final_result and "tok_embeddings.weight" in final_result:
+        print("lm_head.weight not found in checkpoint — tying with embed_tokens")
+        final_result["output.weight"] = final_result["tok_embeddings.weight"].clone()
 
     for key in tuple(final_result.keys()):
         if "wq" in key:
@@ -124,6 +131,17 @@ def convert_hf_checkpoint(
         tokenizer_model_tiktoken = checkpoint_dir / "tokenizer.model"
         print(f"Copying {tokenizer_model} to {tokenizer_model_tiktoken}")
         shutil.copy(tokenizer_model, tokenizer_model_tiktoken)
+    elif 'qwen' in model_name.lower():
+        # Qwen2: tokenizer.json sits directly in checkpoint_dir (HF tokenizers format)
+        # Qwen2.5: qwen.tiktoken sits directly in checkpoint_dir
+        tok_json = checkpoint_dir / "tokenizer.json"
+        tok_tiktoken = checkpoint_dir / "qwen.tiktoken"
+        if tok_tiktoken.exists():
+            print(f"Qwen2.5 tiktoken found at {tok_tiktoken}")
+        elif tok_json.exists():
+            print(f"Qwen2 tokenizer found at {tok_json}")
+        else:
+            print(f"Warning: No Qwen tokenizer found in {checkpoint_dir}")
 
 if __name__ == '__main__':
     import argparse
