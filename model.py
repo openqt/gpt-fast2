@@ -44,6 +44,25 @@ class ModelArgs:
     rope_base: float = 10000
     norm_eps: float = 1e-5
     rope_scaling: Optional[dict] = None
+    # DeepSeek MLA params
+    kv_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
+    # DeepSeek MoE params
+    n_routed_experts: Optional[int] = None
+    n_activated_experts: Optional[int] = None
+    n_shared_experts: Optional[int] = None
+    moe_intermediate_size: Optional[int] = None
+    n_group: Optional[int] = None
+    topk_group: Optional[int] = None
+    routed_scaling_factor: float = 1.0
+    # shared
+    n_embd_head_kv: Optional[int] = None
+    n_expert: Optional[int] = None
+    n_shared_expert: Optional[int] = None
+    n_activated: Optional[int] = None
+    moe: Optional[dict] = None
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -53,6 +72,16 @@ class ModelArgs:
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
         self.head_dim = self.dim // self.n_head
+        # Convert moe dict to individual attributes if present
+        if self.moe is not None:
+            m = self.moe
+            self.n_routed_experts = m.get('n_routed_experts')
+            self.n_activated_experts = m.get('n_activated_experts')
+            self.n_shared_experts = m.get('n_shared_experts')
+            self.moe_intermediate_size = m.get('moe_intermediate_size')
+            self.n_group = m.get('n_group')
+            self.topk_group = m.get('topk_group')
+            self.routed_scaling_factor = m.get('routed_scaling_factor', 1.0)
 
     @classmethod
     def from_name(cls, name: str):
@@ -95,7 +124,44 @@ transformer_configs = {
     "llama-3.2-1b": dict(block_size=131072, n_layer=16, n_head=32, n_local_heads=8, dim=2048, intermediate_size=8192, vocab_size=128256, rope_base=500000,
         rope_scaling=dict(factor=32.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
     ),
+    # DeepSeek-V2
+    "DeepSeek-V2": dict(
+        block_size=4096, vocab_size=102400, n_layer=60,
+        dim=5120, n_head=128, head_dim=128,
+        kv_lora_rank=512, qk_nope_head_dim=64, qk_rope_head_dim=64,
+        v_head_dim=128, intermediate_size=12288,
+        n_routed_experts=160, n_activated_experts=6, n_shared_experts=2,
+        n_group=8, topk_group=4,
+        moe_intermediate_size=1536,
+        norm_eps=1e-6, rope_base=10000,
+        routed_scaling_factor=16.0,
+    ),
+    # DeepSeek-V3
+    "DeepSeek-V3": dict(
+        block_size=8192, vocab_size=129280, n_layer=61,
+        dim=7168, n_head=128, head_dim=128,
+        kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64,
+        v_head_dim=128, intermediate_size=18432,
+        n_routed_experts=256, n_activated_experts=8, n_shared_experts=1,
+        n_group=8, topk_group=4,
+        moe_intermediate_size=2048,
+        norm_eps=1e-6, rope_base=10000,
+        routed_scaling_factor=16.0,
+    ),
+    # DeepSeek-R1
+    "DeepSeek-R1": dict(
+        block_size=8192, vocab_size=129280, n_layer=61,
+        dim=7168, n_head=128, head_dim=128,
+        kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64,
+        v_head_dim=128, intermediate_size=18432,
+        n_routed_experts=256, n_activated_experts=8, n_shared_experts=1,
+        n_group=8, topk_group=4,
+        moe_intermediate_size=2048,
+        norm_eps=1e-6, rope_base=10000,
+        routed_scaling_factor=16.0,
+    ),
 }
+
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
@@ -115,6 +181,29 @@ class KVCache(nn.Module):
         v_out[:, :, input_pos] = v_val
 
         return k_out, v_out
+
+
+class MLAKVCache(nn.Module):
+    """KV cache for Multi-head Latent Attention.
+    
+    Stores compressed KV latent (c) and RoPE part of K (k_rope),
+    significantly reducing cache size compared to standard MHA/GQA.
+    """
+    def __init__(self, max_batch_size, max_seq_length, kv_lora_rank,
+                 n_head, qk_rope_head_dim, v_head_dim, dtype=torch.bfloat16):
+        super().__init__()
+        c_cache = torch.zeros(max_batch_size, max_seq_length, kv_lora_rank, dtype=dtype)
+        self.register_buffer('c_cache', c_cache)
+        k_rope_cache = torch.zeros(max_batch_size, n_head, max_seq_length, qk_rope_head_dim, dtype=dtype)
+        self.register_buffer('k_rope_cache', k_rope_cache)
+
+    def update(self, input_pos, c_val, k_rope_val):
+        # c_val: [B, S, D_c], k_rope_val: [B, H, S, D_rope]
+        assert input_pos.shape[0] == c_val.shape[1]
+        self.c_cache[:, input_pos] = c_val
+        self.k_rope_cache[:, :, input_pos] = k_rope_val
+        return self.c_cache, self.k_rope_cache
+
 
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
@@ -139,16 +228,16 @@ class Transformer(nn.Module):
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
-        dtype = self.output.weight.dtype
+        weight_dtype = self.output.weight.dtype
         # For quantized layers, dtype is encoded in scales
         if hasattr(self.output, "scales"):
-            dtype = self.output.scales.dtype
+            weight_dtype = self.output.scales.dtype
         elif hasattr(self.output, "scales_and_zeros"):
-            dtype = self.output.scales_and_zeros.dtype
+            weight_dtype = self.output.scales_and_zeros.dtype
         for b in self.layers:
-            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
+            b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, weight_dtype)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, weight_dtype, self.config.rope_scaling)
 
     def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
@@ -164,7 +253,15 @@ class Transformer(nn.Module):
 
     @classmethod
     def from_name(cls, name: str):
-        return cls(ModelArgs.from_name(name))
+        config = ModelArgs.from_name(name)
+        # Route to DeepSeek model if MLA params are present
+        if config.kv_lora_rank is not None:
+            return DeepSeekModel(config)
+        # Route to Mixtral model if expert params are present
+        if config.n_expert is not None or config.num_experts is not None:
+            from mixtral_moe.model import Transformer as MixtralModel
+            return MixtralModel(config)
+        return cls(config)
 
 
 class TransformerBlock(nn.Module):
@@ -229,6 +326,272 @@ class Attention(nn.Module):
 
         y = self.wo(y)
         return y
+
+
+class MLA(nn.Module):
+    """Multi-head Latent Attention (DeepSeek-V2/V3).
+    
+    Uses low-rank KV compression via learned down/up projections.
+    The KV cache stores only the compressed latent (c) and RoPE part of K,
+    dramatically reducing cache size vs standard MHA/GQA.
+    """
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.n_head = config.n_head
+        self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_rope_head_dim = config.qk_rope_head_dim
+        self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+        self.v_head_dim = config.v_head_dim
+        self.kv_lora_rank = config.kv_lora_rank
+        self.dim = config.dim
+
+        # Query projections (nope + rope parts)
+        self.wq_nope = nn.Linear(config.dim, config.n_head * config.qk_nope_head_dim, bias=False)
+        self.wq_rope = nn.Linear(config.dim, config.n_head * config.qk_rope_head_dim, bias=False)
+
+        # KV compression (joint down-projection)
+        self.wkv = nn.Linear(config.dim, config.kv_lora_rank, bias=False)
+
+        # K up-projections (from compressed latent)
+        self.wk_nope = nn.Linear(config.kv_lora_rank, config.n_head * config.qk_nope_head_dim, bias=False)
+        self.wk_rope = nn.Linear(config.kv_lora_rank, config.n_head * config.qk_rope_head_dim, bias=False)
+
+        # V up-projection (from compressed latent)
+        self.wv = nn.Linear(config.kv_lora_rank, config.n_head * config.v_head_dim, bias=False)
+
+        # Output projection
+        self.wo = nn.Linear(config.n_head * config.v_head_dim, config.dim, bias=False)
+
+        self.kv_cache: Optional[MLAKVCache] = None
+
+    def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
+        bsz, seqlen, _ = x.shape
+
+        # Compressed KV latent [B, S, kv_lora_rank]
+        c = self.wkv(x)
+
+        # K projections from compressed latent
+        k_nope = self.wk_nope(c)  # [B, S, n_head * qk_nope_head_dim]
+        k_rope = self.wk_rope(c)  # [B, S, n_head * qk_rope_head_dim]
+
+        # V projection from compressed latent
+        v = self.wv(c)  # [B, S, n_head * v_head_dim]
+
+        # Q projections
+        q_nope = self.wq_nope(x)  # [B, S, n_head * qk_nope_head_dim]
+        q_rope = self.wq_rope(x)  # [B, S, n_head * qk_rope_head_dim]
+
+        # Reshape to [B, S, H, D]
+        q_nope = q_nope.view(bsz, seqlen, self.n_head, self.qk_nope_head_dim)
+        q_rope = q_rope.view(bsz, seqlen, self.n_head, self.qk_rope_head_dim)
+        k_nope = k_nope.view(bsz, seqlen, self.n_head, self.qk_nope_head_dim)
+        k_rope = k_rope.view(bsz, seqlen, self.n_head, self.qk_rope_head_dim)
+        v = v.view(bsz, seqlen, self.n_head, self.v_head_dim)
+
+        # Apply RoPE to rope parts only (nope parts are position-agnostic)
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        k_rope = apply_rotary_emb(k_rope, freqs_cis)
+
+        # Concatenate nope + rope
+        q = torch.cat([q_nope, q_rope], dim=-1)  # [B, S, n_head, qk_head_dim]
+        k = torch.cat([k_nope, k_rope], dim=-1)  # [B, S, n_head, qk_head_dim]
+
+        q = q.transpose(1, 2)  # [B, n_head, S, qk_head_dim]
+        k = k.transpose(1, 2)  # [B, n_head, S, qk_head_dim]
+        v = v.transpose(1, 2)  # [B, n_head, S, v_head_dim]
+
+        if self.kv_cache is not None:
+            # Update cache with compressed latent (c) and rope part of K
+            c_cache, k_rope_cache = self.kv_cache.update(input_pos, c, k_rope.transpose(1, 2))
+            # Reconstruct full K and V from cached compressed latent
+            c_full = c_cache.view(bsz * self.kv_cache.c_cache.shape[1], -1)
+            k_nope_full = self.wk_nope(c_full).view(bsz, -1, self.n_head, self.qk_nope_head_dim).transpose(1, 2)
+            v_full = self.wv(c_full).view(bsz, -1, self.n_head, self.v_head_dim).transpose(1, 2)
+            k = torch.cat([k_nope_full, k_rope_cache], dim=-1)
+            v = v_full
+
+        y = flex_attention(q, k, v, block_mask=mask)
+
+        y = y.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        y = self.wo(y)
+        return y
+
+
+class DeepSeekBlock(nn.Module):
+    """Transformer block with MLA + DeepSeekMoE."""
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.attention = MLA(config)
+        self.block_sparse_moe = DeepSeekMoE(config)
+        self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        self.attention_norm = RMSNorm(config.dim, config.norm_eps)
+
+    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
+        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        out = h + self.block_sparse_moe(self.ffn_norm(h))
+        return out
+
+
+class DeepSeekMoE(nn.Module):
+    """DeepSeekMoE with fine-grained experts + shared experts.
+    
+    Uses routed experts with group-limited top-k routing and shared experts.
+    """
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.dim = config.dim
+        self.n_routed_experts = config.n_routed_experts
+        self.n_activated_experts = config.n_activated_experts
+        self.n_shared_experts = config.n_shared_experts
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.moe_intermediate_size = config.moe_intermediate_size
+        self.routed_scaling_factor = config.routed_scaling_factor
+
+        # Shared experts (always active)
+        self.shared_experts = FeedForward(config)
+        if config.n_shared_experts > 1:
+            # If multiple shared experts, stack them
+            self.shared_experts = nn.ModuleList([
+                FeedForward(config) for _ in range(config.n_shared_experts)
+            ])
+
+        # Routed experts (sparsely activated)
+        self.gate = nn.Linear(config.dim, config.n_routed_experts, bias=False)
+        self.experts = nn.Parameter(
+            torch.empty(config.n_routed_experts, 3 * config.moe_intermediate_size, config.dim)
+        )
+        # Use separate w2 for each expert
+        self.experts_w2 = nn.Parameter(
+            torch.empty(config.n_routed_experts, config.dim, config.moe_intermediate_size)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        bsz, seqlen, _ = x.shape
+        x_flat = x.view(-1, self.dim)  # [T, D]
+
+        # Shared experts
+        if isinstance(self.shared_experts, nn.ModuleList):
+            shared_out = sum(e(x) for e in self.shared_experts)
+        else:
+            shared_out = self.shared_experts(x)
+
+        # Gate scores for routing
+        scores = self.gate(x_flat)  # [T, E]
+        scores_soft = F.softmax(scores.float(), dim=-1).type_as(scores)
+
+        # Group-limited top-k routing
+        if self.n_group and self.topk_group:
+            experts_per_group = self.n_routed_experts // self.n_group  # E_g
+            group_scores = scores_soft.view(
+                x_flat.shape[0], self.n_group, experts_per_group
+            ).max(dim=-1).values  # [T, n_group]
+            _, topk_groups = torch.topk(group_scores, self.topk_group, dim=-1)  # [T, topk_group]
+
+            # Create mask for selected groups
+            group_mask = torch.zeros(
+                x_flat.shape[0], self.n_group, device=scores.device, dtype=torch.bool
+            )
+            group_mask.scatter_(1, topk_groups, True)
+            group_mask = group_mask[:, :, None].expand(-1, -1, experts_per_group).reshape(
+                x_flat.shape[0], -1
+            )
+            scores_soft = scores_soft.masked_fill(~group_mask, float('-inf'))
+
+        # Top-k expert selection within eligible groups
+        expert_weights, expert_indices = torch.topk(
+            scores_soft, self.n_activated_experts, dim=-1
+        )  # [T, A], [T, A]
+        expert_weights = expert_weights / expert_weights.sum(dim=-1, keepdim=True)
+
+        # Gather expert parameters
+        T, A = expert_indices.shape
+        w1 = self.experts[expert_indices]  # [T, A, 3*D_ff, D]
+        w2 = self.experts_w2[expert_indices]  # [T, A, D, D_ff]
+
+        # Split merged w1 into w1, w3 (swiGLU variant: gate and up projection)
+        d_ff = self.moe_intermediate_size
+        w1_gate = w1[:, :, :d_ff, :]  # [T, A, D_ff, D]
+        w1_up = w1[:, :, d_ff:2*d_ff, :]  # [T, A, D_ff, D]
+
+        # Compute expert outputs
+        x_gate = torch.einsum('ti,taoi->tao', x_flat, w1_gate)
+        x_up = torch.einsum('ti,taoi->tao', x_flat, w1_up)
+        x_act = F.silu(x_gate) * x_up  # [T, A, D_ff]
+        expert_out = torch.einsum('tao,taio->tai', x_act, w2)  # [T, A, D]
+
+        # Weighted sum of expert outputs
+        routed_out = torch.einsum('tai,ta->ti', expert_out, expert_weights)
+        routed_out = routed_out * self.routed_scaling_factor
+
+        return (routed_out.view(bsz, seqlen, -1) + shared_out)
+
+
+class DeepSeekModel(nn.Module):
+    """DeepSeek-V2/V3 model with MLA and DeepSeekMoE.
+    
+    Supports DeepSeek-V2, DeepSeek-V3, and DeepSeek-R1 architectures.
+    Uses flex_attention for efficient GQA-style attention.
+    """
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.config = config
+
+        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.layers = nn.ModuleList(DeepSeekBlock(config) for _ in range(config.n_layer))
+        self.norm = RMSNorm(config.dim, eps=config.norm_eps)
+        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+
+        self.freqs_cis: Optional[Tensor] = None
+        self.max_batch_size = -1
+        self.max_seq_length = -1
+        self.get_mask_mod = get_mask_mod
+
+    def setup_caches(self, max_batch_size, max_seq_length):
+        if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
+            return
+        max_seq_length = find_multiple(max_seq_length, 8)
+        self.max_seq_length = max_seq_length
+        self.max_batch_size = max_batch_size
+        weight_dtype = self.output.weight.dtype
+        if hasattr(self.output, "scales"):
+            weight_dtype = self.output.scales.dtype
+        elif hasattr(self.output, "scales_and_zeros"):
+            weight_dtype = self.output.scales_and_zeros.dtype
+
+        for b in self.layers:
+            b.attention.kv_cache = MLAKVCache(
+                max_batch_size, max_seq_length,
+                self.config.kv_lora_rank,
+                self.config.n_head,
+                self.config.qk_rope_head_dim,
+                self.config.v_head_dim,
+                weight_dtype,
+            )
+
+        self.freqs_cis = precompute_freqs_cis(
+            self.config.block_size,
+            self.config.qk_rope_head_dim,  # RoPE only applied to rope part
+            self.config.rope_base,
+            weight_dtype,
+            self.config.rope_scaling,
+        )
+
+    def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
+        assert self.freqs_cis is not None, "Caches must be initialized first"
+        mask.mask_mod = self.get_mask_mod(mask.mask_mod, input_pos[0])
+        freqs_cis = self.freqs_cis[input_pos]
+        x = self.tok_embeddings(idx)
+
+        for layer in self.layers:
+            x = layer(x, input_pos, freqs_cis, mask)
+        x = self.norm(x)
+        logits = self.output(x)
+        return logits
+
+    @classmethod
+    def from_name(cls, name: str):
+        return cls(ModelArgs.from_name(name))
 
 
 class FeedForward(nn.Module):
@@ -298,7 +661,7 @@ def precompute_freqs_cis(
 
 # 应用旋转角度
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)  # [B, S, D] -> [B, S, H, D/2, 2]
+    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)  # [B, S, H, D/2, 2]
     freqs_cis = freqs_cis.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
