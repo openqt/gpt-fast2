@@ -12,7 +12,8 @@ import torch.nn.functional as F
 from tokenizer import get_tokenizer
 
 try:
-    from GPTQ import GenericGPTQRunner, InputRecorder
+    from GPTQ import GenericGPTQRunner, InputRecorder, MultiInput
+    from GPTQ import aten, tree_flatten, tree_unflatten
     from eval import get_task_dict, evaluate, lm_eval
 except:
     pass
@@ -548,6 +549,237 @@ class WeightOnlyInt4GPTQQuantHandler(GPTQQuantHandler):
         replace_linear_int4(self.mod, self.groupsize, self.inner_k_tiles, self.padding)
         return self.mod
 
+### AWQ: Activation-aware Weight Quantization ###
+
+class AWQRunner(GenericGPTQRunner):
+    """Subclass of GenericGPTQRunner that records activations for AWQ."""
+
+    def __init__(self, model, inputs, blocksize=128, percdamp=0.01, groupsize=128):
+        super().__init__(model, inputs, blocksize, percdamp, groupsize)
+        self.activation_dict = {}
+
+    def call_function(self, target, args, kwargs, skip_quant=False):
+        # Record input activations for linear layers
+        quantize_linear = (
+            target == aten.linear.default
+            and id(args[1]) in self.id_to_name
+        )
+        if quantize_linear:
+            mod_fqn = ".".join(self.id_to_name[id(args[1])].split(".")[:-1])
+            if mod_fqn not in self.activation_dict:
+                self.activation_dict[mod_fqn] = []
+            # Collect inputs across all calibration batches
+            flat_args, spec = tree_flatten((args, kwargs))
+            has_multi_input = MultiInput in [type(x) for x in flat_args]
+            if has_multi_input:
+                multi_count = max(
+                    [len(x.values) if isinstance(x, MultiInput) else 1 for x in flat_args]
+                )
+                transposed = list(zip(
+                    *[x.values if isinstance(x, MultiInput) else [x] * multi_count for x in flat_args]
+                ))
+                for inp in transposed:
+                    inp = [x.cuda() if isinstance(x, torch.Tensor) else x for x in inp]
+                    cur_args, cur_kwargs = tree_unflatten(inp, spec)
+                    self.activation_dict[mod_fqn].append(cur_args[0].detach().float().cpu())
+            else:
+                self.activation_dict[mod_fqn].append(args[0].detach().float().cpu())
+
+        return super().call_function(target, args, kwargs, skip_quant)
+
+
+class AWQQuantHandler:
+    """Activation-aware Weight Quantization (AWQ)
+
+    Computes per-channel scaling factors from activation distributions,
+    then applies them to reduce quantization error for important channels.
+    """
+
+    def __init__(self, mod, groupsize=128, inner_k_tiles=8, padding=True, alpha=0.5):
+        self.mod = mod
+        self.groupsize = groupsize
+        self.inner_k_tiles = inner_k_tiles
+        self.padding = padding
+        self.alpha = alpha
+        assert groupsize in [32, 64, 128, 256]
+        assert inner_k_tiles in [2, 4, 8]
+
+    @torch.no_grad()
+    def create_quantized_state_dict(
+        self,
+        tokenizer,
+        blocksize,
+        percdamp,
+        groupsize,
+        calibration_tasks,
+        calibration_limit,
+        calibration_seq_length,
+        pad_calibration_inputs,
+        use_cuda=True,
+    ):
+        device = "cuda" if use_cuda else "cpu"
+
+        # Step 1: Get calibration inputs (same as GPTQ)
+        inputs = GPTQQuantHandler.get_inputs(
+            self.mod, tokenizer, calibration_tasks, calibration_limit,
+            calibration_seq_length, pad_calibration_inputs,
+        )
+
+        # Step 2: Run AWQRunner to collect activations for each linear layer
+        print("Running AWQ activation collection...")
+        awq_runner = AWQRunner(self.mod, inputs, blocksize, percdamp, groupsize)
+        awq_runner.run()
+        activation_dict = awq_runner.activation_dict
+
+        # Step 3: Compute per-channel AWQ scaling factors
+        print("Computing AWQ scaling factors...")
+        awq_scales = self._compute_awq_scales(activation_dict)
+
+        # Step 4: Apply scaling and quantize weights
+        cur_state_dict = self.mod.state_dict()
+        for fqn, mod in self.mod.named_modules():
+            if not isinstance(mod, nn.Linear):
+                continue
+            assert not mod.bias
+            out_features = mod.out_features
+            in_features = mod.in_features
+            assert out_features % 8 == 0, f"{fqn}: require out_features % 8 == 0"
+            print(f"linear: {fqn}, in={in_features}, out={out_features}")
+
+            weight = mod.weight.data.clone()
+            needs_padding = not _check_linear_int4_k(in_features, self.groupsize, self.inner_k_tiles)
+
+            # Apply AWQ scaling before quantization
+            if fqn in awq_scales:
+                s = awq_scales[fqn].to(weight.device, weight.dtype)
+                if needs_padding and self.padding:
+                    padded_in_features = find_multiple(in_features, 1024)
+                    s = F.pad(s, pad=(0, padded_in_features - in_features), value=1.0)
+                # Scale weight: W' = W / s (per input channel)
+                weight = weight / s.unsqueeze(0)
+
+            # Pad if needed
+            if needs_padding:
+                if not self.padding:
+                    print(f"warning: {fqn} is skipped, int4 requires compatible in_features")
+                    continue
+                print(f"warning: {fqn} is padded to satisfy in_features % 1024 == 0")
+                padded_in_features = find_multiple(in_features, 1024)
+                weight = F.pad(weight, pad=(0, padded_in_features - in_features))
+
+            # Quantize the (AWQ-scaled) weight using existing int4 pipeline
+            weight_int4pack, scales_and_zeros = prepare_int4_weight_and_scales_and_zeros(
+                weight.to(torch.bfloat16).to(device=device),
+                self.groupsize, self.inner_k_tiles,
+            )
+            cur_state_dict[f"{fqn}.weight"] = weight_int4pack.to("cpu")
+            cur_state_dict[f"{fqn}.scales_and_zeros"] = scales_and_zeros.to("cpu")
+
+            # Store AWQ scales for runtime de-scaling of input
+            if fqn in awq_scales:
+                awq_s = awq_scales[fqn].to(torch.bfloat16).to("cpu")
+                cur_state_dict[f"{fqn}.awq_scales"] = awq_s
+
+        return cur_state_dict
+
+    def _compute_awq_scales(self, activation_dict):
+        """Compute per-channel AWQ scaling factors from activation statistics.
+
+        For each channel, importance = max(|activation|) across all calibration data.
+        Scale = (importance / mean(importance))^alpha.
+        """
+        scales = {}
+        for name, activations in activation_dict.items():
+            if len(activations) == 0:
+                continue
+            # Concatenate all calibration activation samples
+            all_acts = torch.cat(activations, dim=0)  # [*, in_features]
+            # Per-channel importance: max absolute value across batch/seq dims
+            # Flatten all but the last dimension to handle any input shape
+            flat = all_acts.reshape(-1, all_acts.shape[-1])  # [total_elements, in_features]
+            importance = flat.abs().max(dim=0)[0]  # [in_features]
+            imp_mean = importance.mean()
+            # Compute scaling factor
+            s = (importance / (imp_mean + 1e-10)).pow(self.alpha)
+            s = s.clamp(1e-4, 1e4)
+            scales[name] = s
+            print(f"  AWQ scales[{name}]: min={s.min().item():.4f}, max={s.max().item():.4f}, mean={s.mean().item():.4f}")
+        return scales
+
+    def convert_for_runtime(self):
+        replace_linear_int4_awq(self.mod, self.groupsize, self.inner_k_tiles, self.padding)
+        return self.mod
+
+
+def replace_linear_int4_awq(module, groupsize, inner_k_tiles, padding):
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            if _check_linear_int4_k(child.in_features, groupsize, inner_k_tiles):
+                setattr(module, name, AWQLinear(
+                    child.in_features, child.out_features, bias=False,
+                    groupsize=groupsize, inner_k_tiles=inner_k_tiles, padding=False,
+                ))
+            elif padding:
+                setattr(module, name, AWQLinear(
+                    child.in_features, child.out_features, bias=False,
+                    groupsize=groupsize, inner_k_tiles=inner_k_tiles, padding=True,
+                ))
+        else:
+            replace_linear_int4_awq(child, groupsize, inner_k_tiles, padding)
+
+
+class AWQLinear(torch.nn.Module):
+    """Linear layer with AWQ int4 quantization.
+
+    Forward: y = (x * s) @ W_int4  where s is the AWQ per-channel scaling factor.
+    """
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+
+    def __init__(
+        self, in_features: int, out_features: int,
+        bias=True, device=None, dtype=None,
+        groupsize: int = 128, inner_k_tiles: int = 8, padding: bool = True,
+    ) -> None:
+        super().__init__()
+        self.padding = padding
+        if padding:
+            from model import find_multiple
+            self.origin_in_features = in_features
+            in_features = find_multiple(in_features, 1024)
+        self.in_features = in_features
+        self.out_features = out_features
+        assert not bias, "require bias=False"
+        self.groupsize = groupsize
+        self.inner_k_tiles = inner_k_tiles
+        assert out_features % 8 == 0, "require out_features % 8 == 0"
+        assert in_features % (inner_k_tiles * 16) == 0
+        self.register_buffer(
+            "weight",
+            torch.empty((out_features // 8, in_features // (inner_k_tiles * 16), 32, inner_k_tiles // 2), dtype=torch.int32)
+        )
+        self.register_buffer(
+            "scales_and_zeros",
+            torch.empty((in_features // groupsize, out_features, 2), dtype=torch.bfloat16)
+        )
+        # AWQ per-input-channel scaling factor
+        self.register_buffer(
+            "awq_scales",
+            torch.ones(in_features, dtype=torch.bfloat16)
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = input.to(torch.bfloat16)
+        if self.padding:
+            input = F.pad(input, pad=(0, self.in_features - self.origin_in_features))
+        # Apply AWQ input scaling: x *= s
+        input = input * self.awq_scales
+        return linear_forward_int4(
+            input, self.weight, self.scales_and_zeros, self.out_features, self.groupsize
+        )
+
+
 class WeightOnlyInt4Linear(torch.nn.Module):
     __constants__ = ['in_features', 'out_features']
     in_features: int
@@ -640,6 +872,30 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f"{label}int4.g{groupsize}.pth")
 
+    elif mode == 'int4-awq':
+        print("Quantizing model weights for int4 AWQ weight-only quantization...")
+        quant_handler = AWQQuantHandler(model, groupsize)
+
+        tokenizer_path = checkpoint_path.parent / "tokenizer.model"
+        assert tokenizer_path.is_file(), str(tokenizer_path)
+        tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
+
+        quantized_state_dict = quant_handler.create_quantized_state_dict(
+            tokenizer,
+            blocksize,
+            percdamp,
+            groupsize,
+            calibration_tasks,
+            calibration_limit,
+            calibration_seq_length,
+            pad_calibration_inputs,
+            use_cuda=True,
+        )
+
+        dir_name = checkpoint_path.parent
+        base_name = checkpoint_path.name
+        new_base_name = base_name.replace('.pth', f"{label}int4-awq.g{groupsize}.pth")
+
     elif mode == 'int4-gptq':
         print("Quantizing model weights for int4 weight-only affine per-channel groupwise quantization using GPTQ...")
         quant_handler = WeightOnlyInt4GPTQQuantHandler(model, groupsize)
@@ -676,7 +932,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Quantize a model.', exit_on_error=False)
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Path to the model checkpoint to be quantized.')
-    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq'], help='type of quantization to perform')
+    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq', 'int4-awq'], help='type of quantization to perform')
     parser.add_argument('--groupsize', type=int, default=32, help='Group size for int4 quantization.')
     parser.add_argument('--calibration_tasks', type=str, nargs='+', default=['wikitext'], help='tasks to do gptq calibration on, if doing gptq')
     parser.add_argument('--calibration_limit', type=int, default=1000, help='number of samples to use for gptq calibration')
