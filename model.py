@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -40,10 +40,15 @@ class ModelArgs:
     dim: int = 4096
     intermediate_size: int = None
     n_local_heads: int = -1
-    head_dim: int = 64
+    head_dim: Optional[int] = None  # None = auto from dim // n_head
     rope_base: float = 10000
     norm_eps: float = 1e-5
     rope_scaling: Optional[dict] = None
+
+    # Gemma-specific
+    gemma: bool = False
+    attn_logit_softcapping: Optional[float] = None
+    final_logit_softcapping: Optional[float] = None
 
     def __post_init__(self):
         if self.n_local_heads == -1:
@@ -52,7 +57,8 @@ class ModelArgs:
             hidden_dim = 4 * self.dim
             n_hidden = int(2 * hidden_dim / 3)
             self.intermediate_size = find_multiple(n_hidden, 256)
-        self.head_dim = self.dim // self.n_head
+        if self.head_dim is None:
+            self.head_dim = self.dim // self.n_head
 
     @classmethod
     def from_name(cls, name: str):
@@ -95,7 +101,34 @@ transformer_configs = {
     "llama-3.2-1b": dict(block_size=131072, n_layer=16, n_head=32, n_local_heads=8, dim=2048, intermediate_size=8192, vocab_size=128256, rope_base=500000,
         rope_scaling=dict(factor=32.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=8192),
     ),
+    # Gemma 2
+    "gemma-2-2b": dict(block_size=8192, vocab_size=256000, n_layer=18, n_head=8, n_local_heads=4,
+        dim=2048, intermediate_size=16384, head_dim=256, rope_base=10000,
+        norm_eps=1e-6, gemma=True, attn_logit_softcapping=50.0, final_logit_softcapping=30.0,
+    ),
+    "gemma-2-9b": dict(block_size=8192, vocab_size=256000, n_layer=42, n_head=16, n_local_heads=8,
+        dim=3584, intermediate_size=14336, head_dim=256, rope_base=10000,
+        norm_eps=1e-6, gemma=True, attn_logit_softcapping=50.0, final_logit_softcapping=30.0,
+    ),
+    "gemma-2-27b": dict(block_size=8192, vocab_size=256000, n_layer=46, n_head=32, n_local_heads=16,
+        dim=4608, intermediate_size=36864, head_dim=128, rope_base=10000,
+        norm_eps=1e-6, gemma=True, attn_logit_softcapping=50.0, final_logit_softcapping=30.0,
+    ),
+    # Gemma 3 (extended context, no softcapping)
+    "gemma-3-1b": dict(block_size=131072, vocab_size=262144, n_layer=26, n_head=8, n_local_heads=4,
+        dim=1152, intermediate_size=8192, head_dim=256, rope_base=1000000.0,
+        norm_eps=1e-6, gemma=True,
+    ),
+    "gemma-3-12b": dict(block_size=131072, vocab_size=262144, n_layer=40, n_head=24, n_local_heads=8,
+        dim=3840, intermediate_size=15360, head_dim=256, rope_base=1000000.0,
+        norm_eps=1e-6, gemma=True,
+    ),
+    "gemma-3-27b": dict(block_size=131072, vocab_size=262144, n_layer=62, n_head=32, n_local_heads=16,
+        dim=4608, intermediate_size=36864, head_dim=128, rope_base=1000000.0,
+        norm_eps=1e-6, gemma=True,
+    ),
 }
+
 
 class KVCache(nn.Module):
     def __init__(self, max_batch_size, max_seq_length, n_heads, head_dim, dtype=torch.bfloat16):
@@ -116,15 +149,17 @@ class KVCache(nn.Module):
 
         return k_out, v_out
 
+
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.config = config
 
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.n_layer))
+        block = Gemma2TransformerBlock if config.gemma else TransformerBlock
+        self.layers = nn.ModuleList(block(config) for _ in range(config.n_layer))
         self.norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.output = nn.Linear(config.dim, config.vocab_size, bias=config.gemma)
 
         self.freqs_cis: Optional[Tensor] = None
         self.mask_cache: Optional[Tensor] = None
@@ -132,10 +167,41 @@ class Transformer(nn.Module):
         self.max_seq_length = -1
         self.get_mask_mod = get_mask_mod
 
+        if config.gemma:
+            self._register_load_state_dict_pre_hook(self._gemma_state_dict_pre_hook)
+
+    @staticmethod
+    def _gemma_state_dict_pre_hook(state_dict, prefix, *args):
+        """Map HuggingFace Gemma state dict keys to internal gpt-fast format."""
+        replacements = [
+            ('model.', ''),
+            ('self_attn.q_proj', 'attention.wq'),
+            ('self_attn.k_proj', 'attention.wk'),
+            ('self_attn.v_proj', 'attention.wv'),
+            ('self_attn.o_proj', 'attention.wo'),
+            ('mlp.gate_proj', 'feed_forward.w1'),
+            ('mlp.up_proj', 'feed_forward.w3'),
+            ('mlp.down_proj', 'feed_forward.w2'),
+            ('input_layernorm', 'attention_norm'),
+            ('post_attention_layernorm', 'post_attention_norm'),
+            ('pre_feedforward_layernorm', 'ffn_norm'),
+            ('post_feedforward_layernorm', 'post_ffn_norm'),
+            ('embed_tokens', 'tok_embeddings'),
+            ('lm_head', 'output'),
+        ]
+        for old_key in list(state_dict.keys()):
+            if prefix and not old_key.startswith(prefix):
+                continue
+            new_key = old_key
+            for old, new in replacements:
+                new_key = new_key.replace(old, new)
+            if new_key != old_key:
+                state_dict[new_key] = state_dict.pop(old_key)
+
     def setup_caches(self, max_batch_size, max_seq_length):
         if self.max_seq_length >= max_seq_length and self.max_batch_size >= max_batch_size:
             return
-        head_dim = self.config.dim // self.config.n_head
+        head_dim = self.config.head_dim
         max_seq_length = find_multiple(max_seq_length, 8)
         self.max_seq_length = max_seq_length
         self.max_batch_size = max_batch_size
@@ -148,7 +214,7 @@ class Transformer(nn.Module):
         for b in self.layers:
             b.attention.kv_cache = KVCache(max_batch_size, max_seq_length, self.config.n_local_heads, head_dim, dtype)
 
-        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.dim // self.config.n_head, self.config.rope_base, dtype, self.config.rope_scaling)
+        self.freqs_cis = precompute_freqs_cis(self.config.block_size, self.config.head_dim, self.config.rope_base, dtype, self.config.rope_scaling)
 
     def forward(self, mask: BlockMask, idx: Tensor, input_pos: Optional[Tensor] = None) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
@@ -160,6 +226,9 @@ class Transformer(nn.Module):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
         logits = self.output(x)
+        # Apply final logit softcapping for Gemma 2
+        if self.config.final_logit_softcapping is not None:
+            logits = torch.tanh(logits / self.config.final_logit_softcapping) * self.config.final_logit_softcapping
         return logits
 
     @classmethod
@@ -181,6 +250,30 @@ class TransformerBlock(nn.Module):
         return out
 
 
+class Gemma2TransformerBlock(nn.Module):
+    """Gemma 2/3 block with GeGLU FFN and post-attention/FFN norms."""
+
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.attention = Attention(config)
+        self.feed_forward = GeGLUFeedForward(config)
+        self.attention_norm = RMSNorm(config.dim, config.norm_eps)
+        self.post_attention_norm = RMSNorm(config.dim, config.norm_eps)
+        self.ffn_norm = RMSNorm(config.dim, config.norm_eps)
+        self.post_ffn_norm = RMSNorm(config.dim, config.norm_eps)
+
+    def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: BlockMask) -> Tensor:
+        # Pre-attention norm → Attention → Post-attention norm → Add
+        attn_out = self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        attn_out = self.post_attention_norm(attn_out)
+        h = x + attn_out
+        # Pre-FFN norm → FFN (GeGLU) → Post-FFN norm → Add
+        ffn_out = self.feed_forward(self.ffn_norm(h))
+        ffn_out = self.post_ffn_norm(ffn_out)
+        out = h + ffn_out
+        return out
+
+
 class Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -196,6 +289,7 @@ class Attention(nn.Module):
         self.head_dim = config.head_dim
         self.n_local_heads = config.n_local_heads
         self.dim = config.dim
+        self.attn_logit_softcapping = config.attn_logit_softcapping
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
@@ -208,8 +302,9 @@ class Attention(nn.Module):
     def forward(self, x: Tensor, freqs_cis: Tensor, mask: BlockMask, input_pos: Optional[Tensor] = None) -> Tensor:
         bsz, seqlen, _ = x.shape
 
+        q_size = self.n_head * self.head_dim
         kv_size = self.n_local_heads * self.head_dim
-        q, k, v = self.wqkv(x).split([self.dim, kv_size, kv_size], dim=-1)
+        q, k, v = self.wqkv(x).split([q_size, kv_size, kv_size], dim=-1)
 
         q = q.view(bsz, seqlen, self.n_head, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_heads, self.head_dim)
@@ -224,6 +319,10 @@ class Attention(nn.Module):
             k, v = self.kv_cache.update(input_pos, k, v)
 
         y = flex_attention(q, k, v, block_mask=mask, enable_gqa=(self.n_head != self.n_local_heads))
+
+        # Apply attention logit softcapping for Gemma 2
+        if self.attn_logit_softcapping is not None:
+            y = torch.tanh(y / self.attn_logit_softcapping) * self.attn_logit_softcapping
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.dim)
 
@@ -240,6 +339,19 @@ class FeedForward(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
+
+class GeGLUFeedForward(nn.Module):
+    """GeGLU (GELU-gated) FFN used by Gemma 2/3."""
+
+    def __init__(self, config: ModelArgs) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.w3 = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.w2 = nn.Linear(config.intermediate_size, config.dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.w2(F.gelu(self.w1(x), approximate='tanh') * self.w3(x))
 
 
 class RMSNorm(nn.Module):
