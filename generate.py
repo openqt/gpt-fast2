@@ -241,6 +241,14 @@ def _load_model(checkpoint_path, device, precision, use_tp):
         simple_quantizer = WeightOnlyInt8QuantHandler(model)
         model = simple_quantizer.convert_for_runtime()
 
+    if "nf4" in str(checkpoint_path):
+        print("Using NF4 (Normal Float 4-bit) quantization!")
+        path_comps = checkpoint_path.name.split(".")
+        groupsize = int(path_comps[-2][1:])
+        from quantize import WeightOnlyNF4QuantHandler
+        simple_quantizer = WeightOnlyNF4QuantHandler(model, groupsize)
+        model = simple_quantizer.convert_for_runtime()
+
     if "int4" in str(checkpoint_path):
         print("Using int4 weight-only quantization!")
         path_comps = checkpoint_path.name.split(".")

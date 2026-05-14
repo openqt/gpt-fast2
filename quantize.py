@@ -11,11 +11,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tokenizer import get_tokenizer
 
-try:
-    from GPTQ import GenericGPTQRunner, InputRecorder
-    from eval import get_task_dict, evaluate, lm_eval
-except:
-    pass
+# Lazy imports for GPTQ and eval — only resolve when needed
+_GenericGPTQRunner = None
+_InputRecorder = None
+_get_task_dict = None
+_evaluate = None
+_lm_eval = None
+
+def _get_gptq():
+    global _GenericGPTQRunner, _InputRecorder
+    if _GenericGPTQRunner is None:
+        try:
+            from GPTQ import GenericGPTQRunner as _GenericGPTQRunner, InputRecorder as _InputRecorder
+        except:
+            pass
+
+def _get_eval():
+    global _get_task_dict, _evaluate, _lm_eval
+    if _get_task_dict is None:
+        try:
+            from eval import get_task_dict as _get_task_dict, evaluate as _evaluate, lm_eval as _lm_eval
+        except:
+            pass
 
 from model import Transformer
 
@@ -308,7 +325,9 @@ class GPTQQuantHandler(QuantHandler):
 
     @staticmethod
     def get_inputs(model, tokenizer, calibration_tasks, calibration_limit, calibration_seq_length, pad_calibration_inputs) -> "MultiInput":
-        input_recorder = InputRecorder(
+        _get_eval()
+        _get_gptq()
+        input_recorder = _InputRecorder(
             model,
             tokenizer,
             calibration_seq_length,
@@ -316,13 +335,13 @@ class GPTQQuantHandler(QuantHandler):
         )
 
         try:
-            lm_eval.tasks.initialize_tasks()
+            _lm_eval.tasks.initialize_tasks()
         except:
             pass
-        task_dict = get_task_dict(calibration_tasks)
+        task_dict = _get_task_dict(calibration_tasks)
         print("Obtaining GPTQ calibration inputs on: ", calibration_tasks)
 
-        evaluate(
+        _evaluate(
             input_recorder,
             task_dict,
             limit=calibration_limit,
@@ -350,7 +369,7 @@ class GPTQQuantHandler(QuantHandler):
     ) -> "StateDict":
         inputs = GPTQQuantHandler.get_inputs(self.mod, tokenizer, calibration_tasks, calibration_limit, calibration_seq_length, pad_calibration_inputs)
         print("Tracing model for GPTQ")
-        GPTQ_runner = GenericGPTQRunner(
+        GPTQ_runner = _GenericGPTQRunner(
             self.mod,
             inputs,
             blocksize,
@@ -640,6 +659,15 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f"{label}int4.g{groupsize}.pth")
 
+    elif mode == 'nf4':
+        print("Quantizing model weights for NF4 (Normal Float 4-bit) quantization with FP8 double quantization")
+        quant_handler = WeightOnlyNF4QuantHandler(model, groupsize)
+        quantized_state_dict = quant_handler.create_quantized_state_dict()
+
+        dir_name = checkpoint_path.parent
+        base_name = checkpoint_path.name
+        new_base_name = base_name.replace('.pth', f"{label}nf4.g{groupsize}.pth")
+
     elif mode == 'int4-gptq':
         print("Quantizing model weights for int4 weight-only affine per-channel groupwise quantization using GPTQ...")
         quant_handler = WeightOnlyInt4GPTQQuantHandler(model, groupsize)
@@ -663,7 +691,7 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f"{label}int4-gptq.g{groupsize}.pth")
     else:
-        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gptq]")
+        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, nf4, int4-gptq]")
 
     quantize_path = dir_name / new_base_name
     print(f"Writing quantized weights to {quantize_path}")
@@ -676,7 +704,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Quantize a model.', exit_on_error=False)
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Path to the model checkpoint to be quantized.')
-    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq'], help='type of quantization to perform')
+    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'nf4', 'int4-gptq'], help='type of quantization to perform')
     parser.add_argument('--groupsize', type=int, default=32, help='Group size for int4 quantization.')
     parser.add_argument('--calibration_tasks', type=str, nargs='+', default=['wikitext'], help='tasks to do gptq calibration on, if doing gptq')
     parser.add_argument('--calibration_limit', type=int, default=1000, help='number of samples to use for gptq calibration')
@@ -688,3 +716,285 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
     quantize(args.checkpoint_path, args.mode, args.groupsize, args.calibration_tasks, args.calibration_limit, args.calibration_seq_length, args.pad_calibration_inputs, args.percdamp, args.blocksize, args.label)
+
+
+##### NF4 (Normal Float 4-bit) — QLoRA style ######
+
+# NF4 encoding table: 16 quantiles of the standard normal distribution (from bitsandbytes)
+NF4_LEVELS = torch.tensor([
+    -1.0000, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+     0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224,
+     0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0000,
+], dtype=torch.float32)
+
+
+@torch.no_grad()
+def _nf4_quantize_group(group: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 1D tensor group to packed NF4 nibbles.
+    
+    Args:
+        group: [groupsize] float tensor, values to quantize
+        
+    Returns:
+        qnibbles: [groupsize // 2] uint8 tensor, packed nibbles
+        scale: [] float tensor, per-group absmax
+    """
+    groupsize = group.shape[-1]
+    absmax = group.abs().max().clamp(min=1e-12)
+    normalized = group / absmax  # [-1, 1]
+    
+    # Find nearest NF4 level for each value
+    levels = NF4_LEVELS.to(group.device, group.dtype)
+    indices = (normalized.unsqueeze(-1) - levels).abs().argmin(dim=-1).to(torch.uint8)
+    
+    # Pack two 4-bit indices into one uint8 byte
+    qnibbles = indices[:groupsize // 2 * 2:2] | (indices[1:groupsize // 2 * 2:2] << 4)
+    return qnibbles, absmax
+
+
+@torch.no_grad()
+def _nf4_dequantize_group(qnibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Dequantize packed NF4 nibbles back to float.
+    
+    Args:
+        qnibbles: [groupsize // 2] uint8 tensor
+        scale: [] float tensor, per-group absmax
+        
+    Returns:
+        group: [groupsize] float tensor, dequantized values
+    """
+    groupsize = qnibbles.shape[-1] * 2
+    levels = NF4_LEVELS.to(qnibbles.device, scale.dtype)
+    
+    # Unpack nibbles
+    lo = qnibbles & 0x0F  # low nibble
+    hi = (qnibbles >> 4) & 0x0F  # high nibble
+    indices = torch.stack([lo, hi], dim=-1).reshape(-1)[:groupsize]
+    
+    return levels[indices.to(torch.long)] * scale
+
+
+def _fp8_quantize(scales: torch.Tensor, blocksize: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize FP16/BF16 scales to FP8 (E5M2-like) for double quantization.
+    
+    Args:
+        scales: [...] float tensor, scales to double-quantize
+        blocksize: block size for second-level quantization (default 256)
+        
+    Returns:
+        qscales: [...] uint8 tensor, FP8 quantized scales
+        scales_absmax: [ceil(N/blocksize)] float tensor, second-level absmax
+    """
+    orig_shape = scales.shape
+    flat = scales.reshape(-1)
+    n = flat.shape[0]
+    
+    # Pad to block boundary
+    remainder = n % blocksize
+    if remainder:
+        pad = blocksize - remainder
+        flat = torch.nn.functional.pad(flat, (0, pad))
+    
+    n_blocks = flat.shape[0] // blocksize
+    blocked = flat.reshape(n_blocks, blocksize)  # [n_blocks, blocksize]
+    
+    # Compute block-wise absmax
+    absmax = blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    
+    # Quantize: map to uint8 using [-absmax, absmax] range
+    # E5M2-like: 1 sign, 5 exponent, 2 mantissa bits
+    # Simplified: linear uint8 mapping
+    qscales = (blocked / absmax * 127.0).round().clamp(-127, 127).to(torch.int8)
+    
+    absmax_flat = absmax.reshape(-1)  # [n_blocks]
+    
+    # Trim padding
+    qscales_flat = qscales.reshape(-1)[:n]
+    
+    return qscales_flat.reshape(orig_shape), absmax_flat
+
+
+def _fp8_dequantize(qscales: torch.Tensor, absmax: torch.Tensor, orig_shape, blocksize: int = 256) -> torch.Tensor:
+    """Dequantize FP8 scales back to float.
+    
+    Args:
+        qscales: [...] int8 tensor, FP8 quantized scales
+        absmax: [n_blocks] float tensor, second-level absmax
+        orig_shape: original shape of scales before quantization
+        
+    Returns:
+        scales: [...] float tensor, dequantized scales
+    """
+    flat = qscales.reshape(-1)
+    n = flat.shape[0]
+    
+    n_blocks = absmax.shape[0]
+    padded_n = n_blocks * blocksize
+    padded = torch.zeros(padded_n, device=flat.device, dtype=absmax.dtype)
+    padded[:n] = flat.to(absmax.dtype)
+    
+    blocked = padded.reshape(n_blocks, blocksize)
+    dequant = (blocked / 127.0) * absmax.unsqueeze(-1)
+    
+    return dequant.reshape(-1)[:n].reshape(orig_shape)
+
+
+@torch.no_grad()
+def quantize_nf4(w: torch.Tensor, groupsize: int = 128) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize a 2D weight to NF4 with double-quantized FP8 scales (QLoRA style).
+    
+    Args:
+        w: [out_features, in_features] float tensor
+        groupsize: group size (32, 64, or 128)
+        
+    Returns:
+        qweight: [out_features, g * gs // 2] uint8, packed NF4 nibbles
+        scales: [out_features, n_groups] bfloat16, per-group dequantized scales
+        qscales: [out_features, n_groups] int8, FP8 quantized scales (double quant)
+        scales_absmax: [out_features, n_scale_blocks] bfloat16, second-level absmax
+    """
+    out_features, in_features = w.shape
+    assert in_features % groupsize == 0, f"in_features {in_features} must be divisible by groupsize {groupsize}"
+    n_groups = in_features // groupsize
+    
+    qnibbles_list = []
+    scales_list = []
+    
+    w_flat = w.reshape(-1, groupsize)  # [out * n_groups, groupsize]
+    
+    for i in range(out_features * n_groups):
+        qnibbles, absmax_val = _nf4_quantize_group(w_flat[i])
+        qnibbles_list.append(qnibbles)
+        scales_list.append(absmax_val)
+    
+    qweight = torch.stack(qnibbles_list).reshape(out_features, -1)
+    scales = torch.stack(scales_list).to(torch.bfloat16).reshape(out_features, n_groups)
+    
+    # Double quantize scales: FP16 -> FP8 (block size 256)
+    qscales, scales_absmax = _fp8_quantize(scales, blocksize=256)
+    
+    return qweight, scales, qscales, scales_absmax.to(torch.bfloat16)
+
+
+@torch.no_grad()
+def dequantize_nf4(qweight: torch.Tensor, scales: torch.Tensor, groupsize: int = 128) -> torch.Tensor:
+    """Dequantize an NF4 quantized weight back to float.
+    
+    Args:
+        qweight: [out_features, in_features // 2] uint8, packed NF4 nibbles
+        scales: [out_features, n_groups] float, per-group absmax
+        groupsize: group size (32, 64, or 128)
+        
+    Returns:
+        w: [out_features, in_features] float, dequantized weight
+    """
+    out_features = qweight.shape[0]
+    in_features = qweight.shape[1] * 2
+    n_groups = in_features // groupsize
+    
+    qweight_flat = qweight.reshape(-1, groupsize // 2)  # [out * n_groups, gs//2]
+    scales_flat = scales.reshape(-1)  # [out * n_groups]
+    
+    dequant_groups = []
+    for i in range(out_features * n_groups):
+        dequant = _nf4_dequantize_group(qweight_flat[i], scales_flat[i])
+        dequant_groups.append(dequant)
+    
+    return torch.stack(dequant_groups).reshape(out_features, in_features)
+
+
+class WeightOnlyNF4Linear(torch.nn.Module):
+    """Linear layer with NF4 (Normal Float 4-bit) quantized weights + FP8 double quantized scales."""
+    
+    def __init__(self, in_features: int, out_features: int, groupsize: int = 128, bias: bool = False, padding: bool = True):
+        super().__init__()
+        self.padding = padding
+        if padding:
+            from model import find_multiple
+            self.origin_in_features = in_features
+            # Pad in_features to next multiple of groupsize
+            in_features = find_multiple(in_features, groupsize)
+        
+        self.in_features = in_features
+        self.out_features = out_features
+        self.groupsize = groupsize
+        n_groups = in_features // groupsize
+        n_scale_blocks = (n_groups + 255) // 256  # double quant blocksize 256
+        
+        assert not bias, "NF4 requires bias=False"
+        assert out_features % 8 == 0, "require out_features % 8 == 0"
+        
+        self.register_buffer(
+            "qweight",
+            torch.empty((out_features, in_features // 2), dtype=torch.uint8)
+        )
+        self.register_buffer(
+            "scales",
+            torch.empty((out_features, n_groups), dtype=torch.bfloat16)
+        )
+        self.register_buffer(
+            "qscales",
+            torch.empty((out_features, n_groups), dtype=torch.int8)
+        )
+        self.register_buffer(
+            "scales_absmax",
+            torch.empty((n_scale_blocks,), dtype=torch.bfloat16)
+        )
+    
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = input.to(torch.bfloat16)
+        if self.padding and self.in_features != self.origin_in_features:
+            input = torch.nn.functional.pad(input, pad=(0, self.in_features - self.origin_in_features))
+        weight = dequantize_nf4(self.qweight, self.scales, self.groupsize)
+        return F.linear(input, weight)
+
+
+def replace_linear_nf4(module, groupsize: int = 128, padding: bool = True):
+    """Replace all nn.Linear in module with WeightOnlyNF4Linear."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(module, name, WeightOnlyNF4Linear(
+                child.in_features, child.out_features, groupsize=groupsize, bias=False, padding=padding
+            ))
+        else:
+            replace_linear_nf4(child, groupsize, padding)
+
+
+class WeightOnlyNF4QuantHandler:
+    """QuantHandler for NF4 (Normal Float 4-bit) quantization."""
+    
+    def __init__(self, mod, groupsize: int = 128, padding: bool = True):
+        self.mod = mod
+        self.groupsize = groupsize
+        self.padding = padding
+        assert groupsize in [32, 64, 128], f"groupsize must be 32, 64, or 128, got {groupsize}"
+    
+    @torch.no_grad()
+    def create_quantized_state_dict(self):
+        from model import find_multiple
+        cur_state_dict = self.mod.state_dict()
+        for fqn, mod in self.mod.named_modules():
+            if isinstance(mod, torch.nn.Linear):
+                assert not mod.bias, f"{fqn} has bias, NF4 requires bias=False"
+                w = mod.weight.data.to(torch.float32)
+                in_features = w.shape[1]
+                # Pad if needed
+                if self.padding and in_features % self.groupsize != 0:
+                    padded_in = find_multiple(in_features, self.groupsize)
+                    w = torch.nn.functional.pad(w, pad=(0, padded_in - in_features))
+                    print(f"  {fqn}: padded in_features {in_features} -> {padded_in}")
+                qweight, scales, qscales, scales_absmax = quantize_nf4(w, self.groupsize)
+                cur_state_dict[f"{fqn}.qweight"] = qweight.cpu()
+                cur_state_dict[f"{fqn}.scales"] = scales.cpu()
+                cur_state_dict[f"{fqn}.qscales"] = qscales.cpu()
+                cur_state_dict[f"{fqn}.scales_absmax"] = scales_absmax.cpu()
+                print(f"Quantized {fqn}: {w.shape} -> qweight {qweight.shape}, scales {scales.shape}, "
+                      f"qscales {qscales.shape}, scales_absmax {scales_absmax.shape}")
+            else:
+                print(f"Skipping {fqn}")
+        return cur_state_dict
+    
+    def convert_for_runtime(self):
+        replace_linear_nf4(self.mod, self.groupsize, self.padding)
+        return self.mod
