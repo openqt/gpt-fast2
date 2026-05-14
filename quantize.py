@@ -422,6 +422,142 @@ class WeightOnlyInt8Linear(torch.nn.Module):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         return F.linear(input, self.weight.to(dtype=input.dtype)) * self.scales
 
+##### Weight-only FP8 per-channel quantized code ######
+
+FP8_E4M3_MAX = 448.0
+FP8_E5M2_MAX = 57344.0
+
+def has_fp8_support() -> bool:
+    """Check if current GPU supports FP8 tensor cores (H100+ sm_90)."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability() >= (8, 9)
+
+def fp8_quantize_per_channel(
+    x: torch.Tensor,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-channel FP8 quantization for weight matrices.
+    Args:
+        x: [out_features, in_features] bf16/fp32 weight
+        dtype: torch.float8_e4m3fn or torch.float8_e5m2
+    Returns:
+        (fp8_weight [out_features, in_features], scales [out_features] bf16)
+    """
+    assert x.dim() == 2
+    abs_max = x.abs().amax(dim=1)  # [out_features]
+    fp8_max = FP8_E4M3_MAX if dtype == torch.float8_e4m3fn else FP8_E5M2_MAX
+    scales = (abs_max / fp8_max).clamp(min=1e-12)
+    fp8_weight = (x / scales.unsqueeze(-1)).to(dtype)
+    return fp8_weight, scales.to(torch.bfloat16)
+
+def fp8_quantize_per_token(
+    x: torch.Tensor,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-token FP8 quantization for activations.
+    Args:
+        x: [M, K] bf16/fp32 activations
+    Returns:
+        (fp8_x [M, K], scales [M, 1] bf16)
+    """
+    assert x.dim() == 2
+    abs_max = x.abs().amax(dim=-1, keepdim=True)  # [M, 1]
+    fp8_max = FP8_E4M3_MAX if dtype == torch.float8_e4m3fn else FP8_E5M2_MAX
+    scales = (abs_max / fp8_max).clamp(min=1e-12)
+    fp8_x = (x / scales).to(dtype)
+    return fp8_x, scales.to(torch.bfloat16)
+
+def replace_linear_fp8(module: nn.Module) -> None:
+    """Replace all nn.Linear in module with WeightOnlyFP8Linear."""
+    for name, child in module.named_children():
+        if isinstance(child, nn.Linear):
+            setattr(
+                module, name,
+                WeightOnlyFP8Linear(child.in_features, child.out_features),
+            )
+        else:
+            replace_linear_fp8(child)
+
+class WeightOnlyFP8QuantHandler:
+    def __init__(self, mod: nn.Module, dtype: str = 'e4m3'):
+        self.mod = mod
+        assert dtype in ('e4m3', 'e5m2'), "dtype must be 'e4m3' or 'e5m2'"
+        self.fp8_dtype = torch.float8_e4m3fn if dtype == 'e4m3' else torch.float8_e5m2
+
+    @torch.no_grad()
+    def create_quantized_state_dict(self) -> dict:
+        cur_state_dict = self.mod.state_dict()
+        for fqn, mod in self.mod.named_modules():
+            if isinstance(mod, torch.nn.Linear):
+                w = mod.weight.float()
+                fp8_w, scales = fp8_quantize_per_channel(w, self.fp8_dtype)
+                cur_state_dict[f"{fqn}.weight"] = fp8_w
+                cur_state_dict[f"{fqn}.scales"] = scales
+                print(
+                    f"Quantized {fqn}: weight {fp8_w.shape} {fp8_w.dtype}, "
+                    f"scales {scales.shape} {scales.dtype}"
+                )
+        return cur_state_dict
+
+    def convert_for_runtime(self) -> nn.Module:
+        replace_linear_fp8(self.mod)
+        return self.mod
+
+
+class WeightOnlyFP8Linear(torch.nn.Module):
+    __constants__ = ['in_features', 'out_features']
+    in_features: int
+    out_features: int
+    weight: torch.Tensor
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.register_buffer(
+            "weight",
+            torch.empty((out_features, in_features), dtype=torch.float8_e4m3fn),
+        )
+        self.register_buffer(
+            "scales",
+            torch.ones(out_features, dtype=torch.bfloat16),
+        )
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = input.to(torch.bfloat16)
+        orig_shape = input.shape
+        x = input.reshape(-1, orig_shape[-1])  # [M, K]
+
+        if has_fp8_support() and x.shape[0] > 0:
+            # H100 FP8 tensor core path via torch._scaled_mm
+            # x_fp8 [M, K], w_fp8 [K, N], scale_a [M, 1], scale_b [1, N]
+            x_fp8, scale_a = fp8_quantize_per_token(x)
+            w_fp8 = self.weight.t().contiguous()  # [K, N]
+            scale_b = self.scales.unsqueeze(0).to(torch.float32)  # [1, N]
+            # _scaled_mm computes: result = (x_fp8 * scale_a) @ (w_fp8 * scale_b)
+            out, _ = torch._scaled_mm(
+                x_fp8,
+                w_fp8,
+                scale_a=scale_a.to(torch.float32),
+                scale_b=scale_b,
+                out_dtype=torch.bfloat16,
+            )
+        else:
+            # Fallback: dequantize weights to bf16
+            w = self.weight.to(torch.bfloat16) * self.scales.unsqueeze(-1)
+            out = torch.mm(x, w.t())
+
+        return out.reshape(*orig_shape[:-1], -1)
+
+
 ##### weight only int4 per channel groupwise quantized code ######
 
 def prepare_int4_weight_and_scales_and_zeros(weight_bf16, groupsize, inner_k_tiles):
@@ -631,6 +767,24 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f'{label}int8.pth')
 
+    elif mode == 'fp8' or mode == 'fp8_e4m3':
+        print("Quantizing model weights for FP8 weight-only per-channel quantization (E4M3)")
+        quant_handler = WeightOnlyFP8QuantHandler(model, 'e4m3')
+        quantized_state_dict = quant_handler.create_quantized_state_dict()
+
+        dir_name = checkpoint_path.parent
+        base_name = checkpoint_path.name
+        new_base_name = base_name.replace('.pth', f'{label}fp8.pth')
+
+    elif mode == 'fp8_e5m2':
+        print("Quantizing model weights for FP8 weight-only per-channel quantization (E5M2)")
+        quant_handler = WeightOnlyFP8QuantHandler(model, 'e5m2')
+        quantized_state_dict = quant_handler.create_quantized_state_dict()
+
+        dir_name = checkpoint_path.parent
+        base_name = checkpoint_path.name
+        new_base_name = base_name.replace('.pth', f'{label}fp8_e5m2.pth')
+
     elif mode == 'int4':
         print("Quantizing model weights for int4 weight-only affine per-channel groupwise quantization")
         quant_handler = WeightOnlyInt4QuantHandler(model, groupsize)
@@ -663,7 +817,7 @@ def quantize(
         base_name = checkpoint_path.name
         new_base_name = base_name.replace('.pth', f"{label}int4-gptq.g{groupsize}.pth")
     else:
-        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gptq]")
+        raise ValueError(f"Invalid quantization mode {mode} needs to be one of [int8, int4, int4-gptq, fp8, fp8_e4m3, fp8_e5m2]")
 
     quantize_path = dir_name / new_base_name
     print(f"Writing quantized weights to {quantize_path}")
@@ -676,7 +830,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Quantize a model.', exit_on_error=False)
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-llama/Llama-2-7b-chat-hf/model.pth"), help='Path to the model checkpoint to be quantized.')
-    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq'], help='type of quantization to perform')
+    parser.add_argument('--mode', '-q', type=str, default='int8', choices=['int8', 'int4', 'int4-gptq', 'fp8', 'fp8_e4m3', 'fp8_e5m2'], help='type of quantization to perform')
     parser.add_argument('--groupsize', type=int, default=32, help='Group size for int4 quantization.')
     parser.add_argument('--calibration_tasks', type=str, nargs='+', default=['wikitext'], help='tasks to do gptq calibration on, if doing gptq')
     parser.add_argument('--calibration_limit', type=int, default=1000, help='number of samples to use for gptq calibration')
