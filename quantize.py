@@ -730,114 +730,118 @@ NF4_LEVELS = torch.tensor([
 
 
 @torch.no_grad()
-def _nf4_quantize_group(group: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 1D tensor group to packed NF4 nibbles.
+def _nf4_quantize(w: torch.Tensor, groupsize: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorized NF4 quantization of a 2D weight tensor.
     
     Args:
-        group: [groupsize] float tensor, values to quantize
+        w: [out_features, in_features] float tensor
+        groupsize: group size (32, 64, or 128)
         
     Returns:
-        qnibbles: [groupsize // 2] uint8 tensor, packed nibbles
-        scale: [] float tensor, per-group absmax
+        qweight: [out_features, in_features // 2] uint8, packed NF4 nibbles
+        scales: [out_features, n_groups] bf16, per-group absmax
     """
-    groupsize = group.shape[-1]
-    absmax = group.abs().max().clamp(min=1e-12)
-    normalized = group / absmax  # [-1, 1]
+    out_features, in_features = w.shape
+    n_groups = in_features // groupsize
     
-    # Find nearest NF4 level for each value
-    levels = NF4_LEVELS.to(group.device, group.dtype)
+    # Reshape to groups: [out_features * n_groups, groupsize]
+    w_groups = w.reshape(-1, groupsize)
+    
+    # Compute per-group absmax
+    absmax = w_groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+    
+    # Normalize to [-1, 1] and find nearest NF4 level
+    normalized = w_groups / absmax  # [N, groupsize]
+    levels = NF4_LEVELS.to(w.device, w.dtype)
+    
+    # [N, groupsize, 16] -> [N, groupsize] (nearest level index)
     indices = (normalized.unsqueeze(-1) - levels).abs().argmin(dim=-1).to(torch.uint8)
     
-    # Pack two 4-bit indices into one uint8 byte
-    qnibbles = indices[:groupsize // 2 * 2:2] | (indices[1:groupsize // 2 * 2:2] << 4)
-    return qnibbles, absmax
+    # Pack two 4-bit indices per byte
+    lo = indices[:, ::2]        # even positions
+    hi = indices[:, 1::2]       # odd positions
+    packed = lo | (hi << 4)     # [N, groupsize // 2]
+    
+    qweight = packed.reshape(out_features, -1)
+    scales = absmax.squeeze(-1).reshape(out_features, n_groups).to(torch.bfloat16)
+    return qweight, scales
 
 
 @torch.no_grad()
-def _nf4_dequantize_group(qnibbles: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Dequantize packed NF4 nibbles back to float.
+def _nf4_dequantize(qweight: torch.Tensor, scales: torch.Tensor, groupsize: int = 128) -> torch.Tensor:
+    """Vectorized NF4 dequantization.
     
     Args:
-        qnibbles: [groupsize // 2] uint8 tensor
-        scale: [] float tensor, per-group absmax
+        qweight: [out_features, in_features // 2] uint8, packed NF4 nibbles
+        scales: [out_features, n_groups] float, per-group absmax
+        groupsize: group size (32, 64, or 128)
         
     Returns:
-        group: [groupsize] float tensor, dequantized values
+        w: [out_features, in_features] float, dequantized weight
     """
-    groupsize = qnibbles.shape[-1] * 2
-    levels = NF4_LEVELS.to(qnibbles.device, scale.dtype)
+    out_features, in_features = qweight.shape[0], qweight.shape[1] * 2
+    n_groups = in_features // groupsize
     
-    # Unpack nibbles
-    lo = qnibbles & 0x0F  # low nibble
-    hi = (qnibbles >> 4) & 0x0F  # high nibble
-    indices = torch.stack([lo, hi], dim=-1).reshape(-1)[:groupsize]
+    # Unpack nibbles: [out_features, gs // 2] -> [out_features, gs // 2, 2] -> [out_features, gs]
+    lo = (qweight & 0x0F).unsqueeze(-1)           # [out, gs//2, 1]
+    hi = ((qweight >> 4) & 0x0F).unsqueeze(-1)    # [out, gs//2, 1]
+    indices = torch.cat([lo, hi], dim=-1).reshape(out_features, in_features)  # [out, in]
     
-    return levels[indices.to(torch.long)] * scale
+    # Lookup NF4 levels
+    levels = NF4_LEVELS.to(indices.device, scales.dtype)
+    values = levels[indices.long()]  # [out, in]
+    
+    # Apply per-group scale
+    scales_expanded = scales.unsqueeze(-1).expand(-1, -1, groupsize).reshape(out_features, in_features)
+    return values * scales_expanded
 
 
-def _fp8_quantize(scales: torch.Tensor, blocksize: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+def _fp8_quantize(flat_scales: torch.Tensor, blocksize: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize FP16/BF16 scales to FP8 (E5M2-like) for double quantization.
     
     Args:
-        scales: [...] float tensor, scales to double-quantize
-        blocksize: block size for second-level quantization (default 256)
+        flat_scales: [N] float tensor, flattened scales to double-quantize
+        blocksize: block size for second-level quantization
         
     Returns:
-        qscales: [...] uint8 tensor, FP8 quantized scales
-        scales_absmax: [ceil(N/blocksize)] float tensor, second-level absmax
+        qscales: [N] int8 tensor, FP8 quantized scales
+        scales_absmax: [n_blocks] float tensor, second-level absmax (one per block)
     """
-    orig_shape = scales.shape
-    flat = scales.reshape(-1)
-    n = flat.shape[0]
+    n = flat_scales.shape[0]
     
     # Pad to block boundary
     remainder = n % blocksize
     if remainder:
         pad = blocksize - remainder
-        flat = torch.nn.functional.pad(flat, (0, pad))
+        flat_scales = torch.nn.functional.pad(flat_scales, (0, pad))
     
-    n_blocks = flat.shape[0] // blocksize
-    blocked = flat.reshape(n_blocks, blocksize)  # [n_blocks, blocksize]
+    n_blocks = flat_scales.shape[0] // blocksize
+    blocked = flat_scales.reshape(n_blocks, blocksize)
     
-    # Compute block-wise absmax
     absmax = blocked.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    
-    # Quantize: map to uint8 using [-absmax, absmax] range
-    # E5M2-like: 1 sign, 5 exponent, 2 mantissa bits
-    # Simplified: linear uint8 mapping
     qscales = (blocked / absmax * 127.0).round().clamp(-127, 127).to(torch.int8)
     
-    absmax_flat = absmax.reshape(-1)  # [n_blocks]
-    
-    # Trim padding
-    qscales_flat = qscales.reshape(-1)[:n]
-    
-    return qscales_flat.reshape(orig_shape), absmax_flat
+    return qscales.reshape(-1)[:n], absmax.reshape(-1)
 
 
-def _fp8_dequantize(qscales: torch.Tensor, absmax: torch.Tensor, orig_shape, blocksize: int = 256) -> torch.Tensor:
+def _fp8_dequantize(qscales: torch.Tensor, absmax: torch.Tensor, n: int, blocksize: int = 256) -> torch.Tensor:
     """Dequantize FP8 scales back to float.
     
     Args:
-        qscales: [...] int8 tensor, FP8 quantized scales
+        qscales: [N] int8 tensor, FP8 quantized scales
         absmax: [n_blocks] float tensor, second-level absmax
-        orig_shape: original shape of scales before quantization
+        n: original number of elements
+        blocksize: block size used during quantization
         
     Returns:
-        scales: [...] float tensor, dequantized scales
+        scales: [N] float tensor, dequantized scales
     """
-    flat = qscales.reshape(-1)
-    n = flat.shape[0]
-    
     n_blocks = absmax.shape[0]
     padded_n = n_blocks * blocksize
-    padded = torch.zeros(padded_n, device=flat.device, dtype=absmax.dtype)
-    padded[:n] = flat.to(absmax.dtype)
-    
+    padded = torch.zeros(padded_n, device=qscales.device, dtype=absmax.dtype)
+    padded[:n] = qscales.to(absmax.dtype)
     blocked = padded.reshape(n_blocks, blocksize)
-    dequant = (blocked / 127.0) * absmax.unsqueeze(-1)
-    
-    return dequant.reshape(-1)[:n].reshape(orig_shape)
+    return (blocked / 127.0 * absmax.unsqueeze(-1)).reshape(-1)[:n]
 
 
 @torch.no_grad()
@@ -849,59 +853,51 @@ def quantize_nf4(w: torch.Tensor, groupsize: int = 128) -> tuple[torch.Tensor, t
         groupsize: group size (32, 64, or 128)
         
     Returns:
-        qweight: [out_features, g * gs // 2] uint8, packed NF4 nibbles
-        scales: [out_features, n_groups] bfloat16, per-group dequantized scales
-        qscales: [out_features, n_groups] int8, FP8 quantized scales (double quant)
-        scales_absmax: [out_features, n_scale_blocks] bfloat16, second-level absmax
+        qweight: [out_features, in_features // 2] uint8, packed NF4 nibbles
+        qscales: [out_features * n_groups] int8, FP8 quantized scales (for storage)
+        scales_absmax: [ceil(N/256)] bf16, second-level absmax
+        scales: [out_features, n_groups] bf16, pre-dequantized scales (for fast runtime)
     """
     out_features, in_features = w.shape
-    assert in_features % groupsize == 0, f"in_features {in_features} must be divisible by groupsize {groupsize}"
+    assert in_features % groupsize == 0
     n_groups = in_features // groupsize
     
-    qnibbles_list = []
-    scales_list = []
+    # Step 1: NF4 quantize weights
+    qweight, scales = _nf4_quantize(w, groupsize)
+    # scales: [out_features, n_groups] bf16
     
-    w_flat = w.reshape(-1, groupsize)  # [out * n_groups, groupsize]
+    # Step 2: Double quantize scales: FP16 -> FP8
+    flat_scales = scales.reshape(-1)  # [out_features * n_groups]
+    qscales, scales_absmax = _fp8_quantize(flat_scales, blocksize=256)
     
-    for i in range(out_features * n_groups):
-        qnibbles, absmax_val = _nf4_quantize_group(w_flat[i])
-        qnibbles_list.append(qnibbles)
-        scales_list.append(absmax_val)
-    
-    qweight = torch.stack(qnibbles_list).reshape(out_features, -1)
-    scales = torch.stack(scales_list).to(torch.bfloat16).reshape(out_features, n_groups)
-    
-    # Double quantize scales: FP16 -> FP8 (block size 256)
-    qscales, scales_absmax = _fp8_quantize(scales, blocksize=256)
-    
-    return qweight, scales, qscales, scales_absmax.to(torch.bfloat16)
+    return qweight, qscales, scales_absmax.to(torch.bfloat16), scales
 
 
 @torch.no_grad()
 def dequantize_nf4(qweight: torch.Tensor, scales: torch.Tensor, groupsize: int = 128) -> torch.Tensor:
     """Dequantize an NF4 quantized weight back to float.
     
+    Uses pre-dequantized scales (stored from quantize_nf4).
+    """
+    return _nf4_dequantize(qweight, scales, groupsize)
+
+
+@torch.no_grad()
+def restore_scales(qscales: torch.Tensor, scales_absmax: torch.Tensor, out_features: int, n_groups: int) -> torch.Tensor:
+    """Dequantize FP8 scales back to bf16 for runtime use.
+    
     Args:
-        qweight: [out_features, in_features // 2] uint8, packed NF4 nibbles
-        scales: [out_features, n_groups] float, per-group absmax
-        groupsize: group size (32, 64, or 128)
+        qscales: [out_features * n_groups] int8, FP8 quantized scales
+        scales_absmax: [n_blocks] bf16, second-level absmax
+        out_features: number of output features
+        n_groups: number of groups per output row
         
     Returns:
-        w: [out_features, in_features] float, dequantized weight
+        scales: [out_features, n_groups] bf16
     """
-    out_features = qweight.shape[0]
-    in_features = qweight.shape[1] * 2
-    n_groups = in_features // groupsize
-    
-    qweight_flat = qweight.reshape(-1, groupsize // 2)  # [out * n_groups, gs//2]
-    scales_flat = scales.reshape(-1)  # [out * n_groups]
-    
-    dequant_groups = []
-    for i in range(out_features * n_groups):
-        dequant = _nf4_dequantize_group(qweight_flat[i], scales_flat[i])
-        dequant_groups.append(dequant)
-    
-    return torch.stack(dequant_groups).reshape(out_features, in_features)
+    n = out_features * n_groups
+    scales_flat = _fp8_dequantize(qscales, scales_absmax, n, blocksize=256)
+    return scales_flat.reshape(out_features, n_groups).to(torch.bfloat16)
 
 
 class WeightOnlyNF4Linear(torch.nn.Module):
@@ -913,40 +909,29 @@ class WeightOnlyNF4Linear(torch.nn.Module):
         if padding:
             from model import find_multiple
             self.origin_in_features = in_features
-            # Pad in_features to next multiple of groupsize
             in_features = find_multiple(in_features, groupsize)
         
         self.in_features = in_features
         self.out_features = out_features
         self.groupsize = groupsize
         n_groups = in_features // groupsize
-        n_scale_blocks = (n_groups + 255) // 256  # double quant blocksize 256
+        n_scale_blocks = (out_features * n_groups + 255) // 256
         
         assert not bias, "NF4 requires bias=False"
         assert out_features % 8 == 0, "require out_features % 8 == 0"
         
-        self.register_buffer(
-            "qweight",
-            torch.empty((out_features, in_features // 2), dtype=torch.uint8)
-        )
-        self.register_buffer(
-            "scales",
-            torch.empty((out_features, n_groups), dtype=torch.bfloat16)
-        )
-        self.register_buffer(
-            "qscales",
-            torch.empty((out_features, n_groups), dtype=torch.int8)
-        )
-        self.register_buffer(
-            "scales_absmax",
-            torch.empty((n_scale_blocks,), dtype=torch.bfloat16)
-        )
+        self.register_buffer("qweight", torch.empty((out_features, in_features // 2), dtype=torch.uint8))
+        # FP8 quantized scales (double quant) for storage efficiency
+        self.register_buffer("qscales", torch.empty((out_features * n_groups,), dtype=torch.int8))
+        self.register_buffer("scales_absmax", torch.empty((n_scale_blocks,), dtype=torch.bfloat16))
+        # Pre-dequantized scales for fast runtime inference
+        self.register_buffer("scales", torch.empty((out_features, n_groups), dtype=torch.bfloat16))
     
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         input = input.to(torch.bfloat16)
         if self.padding and self.in_features != self.origin_in_features:
             input = torch.nn.functional.pad(input, pad=(0, self.in_features - self.origin_in_features))
-        weight = dequantize_nf4(self.qweight, self.scales, self.groupsize)
+        weight = _nf4_dequantize(self.qweight, self.scales, self.groupsize)
         return F.linear(input, weight)
 
 
@@ -978,18 +963,18 @@ class WeightOnlyNF4QuantHandler:
             if isinstance(mod, torch.nn.Linear):
                 assert not mod.bias, f"{fqn} has bias, NF4 requires bias=False"
                 w = mod.weight.data.to(torch.float32)
-                in_features = w.shape[1]
-                # Pad if needed
-                if self.padding and in_features % self.groupsize != 0:
-                    padded_in = find_multiple(in_features, self.groupsize)
-                    w = torch.nn.functional.pad(w, pad=(0, padded_in - in_features))
-                    print(f"  {fqn}: padded in_features {in_features} -> {padded_in}")
-                qweight, scales, qscales, scales_absmax = quantize_nf4(w, self.groupsize)
+                in_f = w.shape[1]
+                if self.padding and in_f % self.groupsize != 0:
+                    padded_in = find_multiple(in_f, self.groupsize)
+                    w = torch.nn.functional.pad(w, pad=(0, padded_in - in_f))
+                    print(f"  {fqn}: padded in_features {in_f} -> {padded_in}")
+                
+                qweight, qscales, scales_absmax, scales = quantize_nf4(w, self.groupsize)
                 cur_state_dict[f"{fqn}.qweight"] = qweight.cpu()
-                cur_state_dict[f"{fqn}.scales"] = scales.cpu()
                 cur_state_dict[f"{fqn}.qscales"] = qscales.cpu()
                 cur_state_dict[f"{fqn}.scales_absmax"] = scales_absmax.cpu()
-                print(f"Quantized {fqn}: {w.shape} -> qweight {qweight.shape}, scales {scales.shape}, "
+                cur_state_dict[f"{fqn}.scales"] = scales.cpu()
+                print(f"Quantized {fqn}: {w.shape} -> qweight {qweight.shape}, "
                       f"qscales {qscales.shape}, scales_absmax {scales_absmax.shape}")
             else:
                 print(f"Skipping {fqn}")
